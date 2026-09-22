@@ -145,5 +145,21 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
         /// the proxy must expose the same <c>/t/p/</c> layout as the official endpoint.
         /// </summary>
         public string TmdbImageUrl { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the timeout, in seconds, applied to each individual TMDb request. A request
+        /// that does not complete within this window is treated as a transient failure and retried.
+        /// Bounding it matters because the underlying HTTP client otherwise waits 100 seconds,
+        /// which stalls an entire search while the endpoint is briefly unreachable.
+        /// Changes take effect after restarting the server.
+        /// </summary>
+        public int RequestTimeoutSeconds { get; set; } = 20;
+
+        /// <summary>
+        /// Gets or sets how many times a request that failed with a transient network or server
+        /// error is retried, using exponential backoff. Set to 0 to disable retries.
+        /// Changes take effect after restarting the server.
+        /// </summary>
+        public int MaxRetryCount { get; set; } = 2;
     }
 }
