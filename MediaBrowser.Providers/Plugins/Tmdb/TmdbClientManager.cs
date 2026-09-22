@@ -1,14 +1,18 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Net;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Providers;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
 using TMDbLib.Client;
 using TMDbLib.Objects.Collections;
+using TMDbLib.Objects.Exceptions;
 using TMDbLib.Objects.Find;
 using TMDbLib.Objects.General;
 using TMDbLib.Objects.Movies;
@@ -39,21 +43,126 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
         private readonly MemoryCache _memoryCache;
         private readonly TMDbClient _tmDbClient;
+        private readonly ILogger<TmdbClientManager> _logger;
+        private readonly int _maxRetryCount;
+
+        // The base URL requests are sent to, kept so failures can log the exact URL that timed out.
+        private readonly string _requestBaseUrl;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="TmdbClientManager"/> class.
         /// </summary>
-        public TmdbClientManager()
+        /// <param name="logger">The logger.</param>
+        public TmdbClientManager(ILogger<TmdbClientManager> logger)
         {
+            _logger = logger;
             _memoryCache = new MemoryCache(new MemoryCacheOptions { SizeLimit = CacheSizeLimit });
 
             var apiKey = Plugin.Instance.Configuration.TmdbApiKey;
             apiKey = string.IsNullOrEmpty(apiKey) ? TmdbUtils.ApiKey : apiKey;
-            _tmDbClient = new TMDbClient(apiKey);
+
+            // Route requests through a reverse proxy when a valid API endpoint is configured.
+            if (TmdbEndpointResolver.TryGetApiEndpoint(out var apiHost, out var useSsl))
+            {
+                _tmDbClient = new TMDbClient(apiKey, useSsl, apiHost);
+                _requestBaseUrl = $"{(useSsl ? "https" : "http")}://{apiHost}/3/";
+            }
+            else
+            {
+                _tmDbClient = new TMDbClient(apiKey);
+                _requestBaseUrl = "https://api.themoviedb.org/3/";
+            }
 
             // Not really interested in NotFoundException
             _tmDbClient.ThrowApiExceptions = false;
+
+            // Bound how long a single request may hang. Left unset the underlying HttpClient waits
+            // 100 seconds, which stalls an entire search when the proxy is briefly unreachable.
+            _tmDbClient.Timeout = TimeSpan.FromSeconds(GetRequestTimeoutSeconds());
+            _maxRetryCount = GetMaxRetryCount();
         }
+
+        /// <summary>
+        /// Runs a TMDb request, logging the URL of failures and retrying transient ones with
+        /// exponential backoff. TMDbLib only retries rate-limited calls, so network failures and
+        /// timeouts have to be handled here.
+        /// </summary>
+        /// <typeparam name="T">The type returned by the request.</typeparam>
+        /// <param name="request">The TMDb API path being requested, used for logging.</param>
+        /// <param name="requestFunc">The request to run.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The result of the request.</returns>
+        private async Task<T> SendWithRetryAsync<T>(string request, Func<CancellationToken, Task<T>> requestFunc, CancellationToken cancellationToken)
+        {
+            var url = _requestBaseUrl + request;
+
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    return await requestFunc(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (IsTransient(ex, cancellationToken))
+                {
+                    if (attempt > _maxRetryCount)
+                    {
+                        _logger.LogError(ex, "TMDb request to {Url} failed after {Attempts} attempt(s).", url, attempt);
+                        throw;
+                    }
+
+                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt - 1));
+                    _logger.LogWarning(
+                        ex,
+                        "TMDb request to {Url} failed (attempt {Attempt}/{TotalAttempts}), retrying in {Delay} seconds.",
+                        url,
+                        attempt,
+                        _maxRetryCount + 1,
+                        delay.TotalSeconds);
+
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Determines whether a failed request is worth retrying. A timeout surfaces as a
+        /// cancellation, so the caller's token is consulted to tell the two apart: a cancellation
+        /// the caller asked for must not be retried, an HttpClient timeout must.
+        /// </summary>
+        /// <param name="ex">The exception thrown by the request.</param>
+        /// <param name="cancellationToken">The token the request was issued with.</param>
+        /// <returns><c>true</c> if the request should be retried; otherwise <c>false</c>.</returns>
+        private static bool IsTransient(Exception ex, CancellationToken cancellationToken)
+        {
+            if (ex is OperationCanceledException)
+            {
+                return !cancellationToken.IsCancellationRequested;
+            }
+
+            return ex is HttpRequestException
+                || ex is GeneralHttpException
+                {
+                    HttpStatusCode: HttpStatusCode.RequestTimeout
+                        or HttpStatusCode.InternalServerError
+                        or HttpStatusCode.BadGateway
+                        or HttpStatusCode.ServiceUnavailable
+                        or HttpStatusCode.GatewayTimeout
+                };
+        }
+
+        /// <summary>
+        /// Gets the configured per-request timeout, clamped to a usable range.
+        /// </summary>
+        /// <returns>The timeout in seconds.</returns>
+        private static int GetRequestTimeoutSeconds()
+            => Math.Clamp(Plugin.Instance.Configuration.RequestTimeoutSeconds, 1, 300);
+
+        /// <summary>
+        /// Gets the configured retry count, clamped to a usable range.
+        /// </summary>
+        /// <returns>The number of retries.</returns>
+        private static int GetMaxRetryCount()
+            => Math.Clamp(Plugin.Instance.Configuration.MaxRetryCount, 0, 10);
 
         /// <summary>
         /// Gets a movie from the TMDb API based on its TMDb id.
@@ -80,11 +189,14 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
                 extraMethods |= MovieMethods.Keywords;
             }
 
-            movie = await _tmDbClient.GetMovieAsync(
-                tmdbId,
-                TmdbUtils.NormalizeLanguage(language, countryCode),
-                imageLanguages,
-                extraMethods,
+            movie = await SendWithRetryAsync(
+                $"movie/{tmdbId}",
+                ct => _tmDbClient.GetMovieAsync(
+                    tmdbId,
+                    TmdbUtils.NormalizeLanguage(language, countryCode),
+                    imageLanguages,
+                    extraMethods,
+                    ct),
                 cancellationToken).ConfigureAwait(false);
 
             if (movie is not null)
@@ -114,11 +226,14 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            collection = await _tmDbClient.GetCollectionAsync(
-                tmdbId,
-                TmdbUtils.NormalizeLanguage(language, countryCode),
-                imageLanguages,
-                CollectionMethods.Images,
+            collection = await SendWithRetryAsync(
+                $"collection/{tmdbId}",
+                ct => _tmDbClient.GetCollectionAsync(
+                    tmdbId,
+                    TmdbUtils.NormalizeLanguage(language, countryCode),
+                    imageLanguages,
+                    CollectionMethods.Images,
+                    ct),
                 cancellationToken).ConfigureAwait(false);
 
             if (collection is not null)
@@ -154,12 +269,15 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
                 extraMethods |= TvShowMethods.Keywords;
             }
 
-            series = await _tmDbClient.GetTvShowAsync(
-                tmdbId,
-                language: TmdbUtils.NormalizeLanguage(language, countryCode),
-                includeImageLanguage: imageLanguages,
-                extraMethods: extraMethods,
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            series = await SendWithRetryAsync(
+                $"tv/{tmdbId}",
+                ct => _tmDbClient.GetTvShowAsync(
+                    tmdbId,
+                    language: TmdbUtils.NormalizeLanguage(language, countryCode),
+                    includeImageLanguage: imageLanguages,
+                    extraMethods: extraMethods,
+                    cancellationToken: ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (series is not null)
             {
@@ -212,10 +330,13 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
                 return null;
             }
 
-            group = await _tmDbClient.GetTvEpisodeGroupsAsync(
-                episodeGroupId,
-                language: TmdbUtils.NormalizeLanguage(language, countryCode),
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            group = await SendWithRetryAsync(
+                $"tv/episode_group/{episodeGroupId}",
+                ct => _tmDbClient.GetTvEpisodeGroupsAsync(
+                    episodeGroupId,
+                    language: TmdbUtils.NormalizeLanguage(language, countryCode),
+                    cancellationToken: ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (group is not null)
             {
@@ -245,13 +366,16 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            season = await _tmDbClient.GetTvSeasonAsync(
-                tvShowId,
-                seasonNumber,
-                language: TmdbUtils.NormalizeLanguage(language, countryCode),
-                includeImageLanguage: imageLanguages,
-                extraMethods: TvSeasonMethods.Credits | TvSeasonMethods.Images | TvSeasonMethods.ExternalIds | TvSeasonMethods.Videos,
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            season = await SendWithRetryAsync(
+                $"tv/{tvShowId}/season/{seasonNumber}",
+                ct => _tmDbClient.GetTvSeasonAsync(
+                    tvShowId,
+                    seasonNumber,
+                    language: TmdbUtils.NormalizeLanguage(language, countryCode),
+                    includeImageLanguage: imageLanguages,
+                    extraMethods: TvSeasonMethods.Credits | TvSeasonMethods.Images | TvSeasonMethods.ExternalIds | TvSeasonMethods.Videos,
+                    cancellationToken: ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (season is not null)
             {
@@ -296,14 +420,17 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
                 }
             }
 
-            episode = await _tmDbClient.GetTvEpisodeAsync(
-                tvShowId,
-                seasonNumber,
-                episodeNumber,
-                language: TmdbUtils.NormalizeLanguage(language, countryCode),
-                includeImageLanguage: imageLanguages,
-                extraMethods: TvEpisodeMethods.Credits | TvEpisodeMethods.Images | TvEpisodeMethods.ExternalIds | TvEpisodeMethods.Videos,
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            episode = await SendWithRetryAsync(
+                $"tv/{tvShowId}/season/{seasonNumber}/episode/{episodeNumber}",
+                ct => _tmDbClient.GetTvEpisodeAsync(
+                    tvShowId,
+                    seasonNumber,
+                    episodeNumber,
+                    language: TmdbUtils.NormalizeLanguage(language, countryCode),
+                    includeImageLanguage: imageLanguages,
+                    extraMethods: TvEpisodeMethods.Credits | TvEpisodeMethods.Images | TvEpisodeMethods.ExternalIds | TvEpisodeMethods.Videos,
+                    cancellationToken: ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (episode is not null)
             {
@@ -331,10 +458,13 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            person = await _tmDbClient.GetPersonAsync(
-                personTmdbId,
-                TmdbUtils.NormalizeLanguage(language, countryCode),
-                PersonMethods.Images | PersonMethods.ExternalIds,
+            person = await SendWithRetryAsync(
+                $"person/{personTmdbId}",
+                ct => _tmDbClient.GetPersonAsync(
+                    personTmdbId,
+                    TmdbUtils.NormalizeLanguage(language, countryCode),
+                    PersonMethods.Images | PersonMethods.ExternalIds,
+                    ct),
                 cancellationToken).ConfigureAwait(false);
 
             if (person is not null)
@@ -369,10 +499,13 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            result = await _tmDbClient.FindAsync(
-                source,
-                externalId,
-                TmdbUtils.NormalizeLanguage(language, countryCode),
+            result = await SendWithRetryAsync(
+                $"find/{externalId}",
+                ct => _tmDbClient.FindAsync(
+                    source,
+                    externalId,
+                    TmdbUtils.NormalizeLanguage(language, countryCode),
+                    ct),
                 cancellationToken).ConfigureAwait(false);
 
             if (result is not null)
@@ -402,9 +535,10 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            var searchResults = await _tmDbClient
-                .SearchTvShowAsync(name, TmdbUtils.NormalizeLanguage(language, countryCode), includeAdult: Plugin.Instance.Configuration.IncludeAdult, firstAirDateYear: year, cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
+            var searchResults = await SendWithRetryAsync(
+                $"search/tv?query={name}&year={year}",
+                ct => _tmDbClient.SearchTvShowAsync(name, TmdbUtils.NormalizeLanguage(language, countryCode), includeAdult: Plugin.Instance.Configuration.IncludeAdult, firstAirDateYear: year, cancellationToken: ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (searchResults?.Results?.Count > 0)
             {
@@ -430,9 +564,10 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            var searchResults = await _tmDbClient
-                .SearchPersonAsync(name, includeAdult: Plugin.Instance.Configuration.IncludeAdult, cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
+            var searchResults = await SendWithRetryAsync(
+                $"search/person?query={name}",
+                ct => _tmDbClient.SearchPersonAsync(name, includeAdult: Plugin.Instance.Configuration.IncludeAdult, cancellationToken: ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (searchResults?.Results?.Count > 0)
             {
@@ -473,9 +608,10 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            var searchResults = await _tmDbClient
-                .SearchMovieAsync(name, TmdbUtils.NormalizeLanguage(language, countryCode), includeAdult: Plugin.Instance.Configuration.IncludeAdult, year: year, cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
+            var searchResults = await SendWithRetryAsync(
+                $"search/movie?query={name}&year={year}",
+                ct => _tmDbClient.SearchMovieAsync(name, TmdbUtils.NormalizeLanguage(language, countryCode), includeAdult: Plugin.Instance.Configuration.IncludeAdult, year: year, cancellationToken: ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (searchResults?.Results?.Count > 0)
             {
@@ -503,9 +639,10 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            var searchResults = await _tmDbClient
-                .SearchCollectionAsync(name, TmdbUtils.NormalizeLanguage(language, countryCode), cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
+            var searchResults = await SendWithRetryAsync(
+                $"search/collection?query={name}",
+                ct => _tmDbClient.SearchCollectionAsync(name, TmdbUtils.NormalizeLanguage(language, countryCode), cancellationToken: ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (searchResults?.Results?.Count > 0)
             {
@@ -527,9 +664,10 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
         {
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            var searchResults = await _tmDbClient
-                .GetMovieRecommendationsAsync(tmdbId, language, page, cancellationToken)
-                .ConfigureAwait(false);
+            var searchResults = await SendWithRetryAsync(
+                $"movie/{tmdbId}/recommendations?page={page}",
+                ct => _tmDbClient.GetMovieRecommendationsAsync(tmdbId, language, page, ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (searchResults?.Results is null || searchResults.Results.Count == 0)
             {
@@ -551,9 +689,10 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
         {
             await EnsureClientConfigAsync().ConfigureAwait(false);
 
-            var searchResults = await _tmDbClient
-                .GetTvShowRecommendationsAsync(tmdbId, language, page, cancellationToken)
-                .ConfigureAwait(false);
+            var searchResults = await SendWithRetryAsync(
+                $"tv/{tmdbId}/recommendations?page={page}",
+                ct => _tmDbClient.GetTvShowRecommendationsAsync(tmdbId, language, page, ct),
+                cancellationToken).ConfigureAwait(false);
 
             if (searchResults?.Results is null || searchResults.Results.Count == 0)
             {
@@ -578,6 +717,12 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             // Use the original size as default if size is null or empty to prevent malformed URLs
             var imageSize = string.IsNullOrEmpty(size) ? TmdbUtils.OriginalImageSize : size;
+
+            // Serve images from the reverse proxy when a valid endpoint is configured.
+            if (TmdbEndpointResolver.TryGetImageUrl(imageSize, path, out var proxiedImageUrl))
+            {
+                return proxiedImageUrl;
+            }
 
             return _tmDbClient.GetImageUrl(imageSize, path, true).ToString();
         }
@@ -703,7 +848,9 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
         {
             if (!_tmDbClient.HasConfig)
             {
-                var config = await _tmDbClient.GetConfigAsync().ConfigureAwait(false);
+                // GetConfigAsync takes no token, so a caller cancellation cannot be observed here.
+                // The request is still bounded by the configured timeout and retried on failure.
+                var config = await SendWithRetryAsync("configuration", _ => _tmDbClient.GetConfigAsync(), CancellationToken.None).ConfigureAwait(false);
                 ValidatePreferences(config);
             }
         }

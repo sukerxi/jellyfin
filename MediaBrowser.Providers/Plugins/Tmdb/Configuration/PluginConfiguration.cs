@@ -129,5 +129,37 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
         /// Gets or sets the cache duration in days for similar item results. A value of 0 disables caching.
         /// </summary>
         public int SimilarItemsCacheDays { get; set; } = 90;
+
+        /// <summary>
+        /// Gets or sets the reverse-proxy URL used in place of the official TMDb API endpoint
+        /// (api.themoviedb.org). Leave empty to use the official endpoint.
+        /// The value must be an absolute URL, e.g. <c>https://tmdb-proxy.example.com</c>;
+        /// an optional sub-path is supported. Changes take effect after restarting the server.
+        /// </summary>
+        public string TmdbApiUrl { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the reverse-proxy URL used in place of the official TMDb image endpoint
+        /// (image.tmdb.org). Leave empty to use the official endpoint.
+        /// The value must be an absolute URL, e.g. <c>https://tmdb-proxy.example.com</c>;
+        /// the proxy must expose the same <c>/t/p/</c> layout as the official endpoint.
+        /// </summary>
+        public string TmdbImageUrl { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the timeout, in seconds, applied to each individual TMDb request. A request
+        /// that does not complete within this window is treated as a transient failure and retried.
+        /// Bounding it matters because the underlying HTTP client otherwise waits 100 seconds,
+        /// which stalls an entire search while the endpoint is briefly unreachable.
+        /// Changes take effect after restarting the server.
+        /// </summary>
+        public int RequestTimeoutSeconds { get; set; } = 20;
+
+        /// <summary>
+        /// Gets or sets how many times a request that failed with a transient network or server
+        /// error is retried, using exponential backoff. Set to 0 to disable retries.
+        /// Changes take effect after restarting the server.
+        /// </summary>
+        public int MaxRetryCount { get; set; } = 2;
     }
 }
