@@ -9,6 +9,17 @@
             <div class="content-primary">
                 <h1>TMDb</h1>
                 <form class="configForm">
+                    <div class="verticalSection">
+                        <h2>Proxy Settings</h2>
+                        <div class="inputContainer inputContainer-withDescription">
+                            <input is="emby-input" type="url" id="tmdbApiUrl" label="TMDb API Proxy URL" />
+                            <div class="fieldDescription">Custom base URL for TMDb API requests (reverse proxy). Leave empty to use the default api.themoviedb.org. Example: https://tmdb-proxy.example.com</div>
+                        </div>
+                        <div class="inputContainer inputContainer-withDescription">
+                            <input is="emby-input" type="url" id="tmdbImageUrl" label="TMDb Image Proxy URL" />
+                            <div class="fieldDescription">Custom base URL for TMDb image requests (reverse proxy). Leave empty to use the default image.tmdb.org. Example: https://tmdb-proxy.example.com</div>
+                        </div>
+                    </div>
                     <label class="checkboxContainer">
                         <input is="emby-checkbox" type="checkbox" id="includeAdult" />
                         <span>Include adult content in search results.</span>
@@ -205,6 +216,8 @@
 
                     ApiClient.getPluginConfiguration(PluginConfig.pluginId).then(function (config) {
                         document.querySelector('#includeAdult').checked = config.IncludeAdult;
+                        document.querySelector('#tmdbApiUrl').value = config.TmdbApiUrl;
+                        document.querySelector('#tmdbImageUrl').value = config.TmdbImageUrl;
                         document.querySelector('#excludeTagsSeries').checked = config.ExcludeTagsSeries;
                         document.querySelector('#excludeTagsMovies').checked = config.ExcludeTagsMovies;
                         document.querySelector('#importSeasonName').checked = config.ImportSeasonName;
@@ -249,6 +262,8 @@
                     Dashboard.showLoadingMsg();
 
                     ApiClient.getPluginConfiguration(PluginConfig.pluginId).then(function (config) {
+                        config.TmdbApiUrl = document.querySelector('#tmdbApiUrl').value;
+                        config.TmdbImageUrl = document.querySelector('#tmdbImageUrl').value;
                         config.IncludeAdult = document.querySelector('#includeAdult').checked;
                         config.ExcludeTagsSeries = document.querySelector('#excludeTagsSeries').checked;
                         config.ExcludeTagsMovies = document.querySelector('#excludeTagsMovies').checked;

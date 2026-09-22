@@ -49,7 +49,11 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             var apiKey = Plugin.Instance.Configuration.TmdbApiKey;
             apiKey = string.IsNullOrEmpty(apiKey) ? TmdbUtils.ApiKey : apiKey;
-            _tmDbClient = new TMDbClient(apiKey);
+
+            // Route requests through a reverse proxy when a valid API endpoint is configured.
+            _tmDbClient = TmdbEndpointResolver.TryGetApiEndpoint(out var apiHost, out var useSsl)
+                ? new TMDbClient(apiKey, useSsl, apiHost)
+                : new TMDbClient(apiKey);
 
             // Not really interested in NotFoundException
             _tmDbClient.ThrowApiExceptions = false;
@@ -578,6 +582,12 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
 
             // Use the original size as default if size is null or empty to prevent malformed URLs
             var imageSize = string.IsNullOrEmpty(size) ? TmdbUtils.OriginalImageSize : size;
+
+            // Serve images from the reverse proxy when a valid endpoint is configured.
+            if (TmdbEndpointResolver.TryGetImageUrl(imageSize, path, out var proxiedImageUrl))
+            {
+                return proxiedImageUrl;
+            }
 
             return _tmDbClient.GetImageUrl(imageSize, path, true).ToString();
         }

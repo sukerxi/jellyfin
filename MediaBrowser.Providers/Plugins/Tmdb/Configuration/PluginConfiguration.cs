@@ -129,5 +129,21 @@ namespace MediaBrowser.Providers.Plugins.Tmdb
         /// Gets or sets the cache duration in days for similar item results. A value of 0 disables caching.
         /// </summary>
         public int SimilarItemsCacheDays { get; set; } = 90;
+
+        /// <summary>
+        /// Gets or sets the reverse-proxy URL used in place of the official TMDb API endpoint
+        /// (api.themoviedb.org). Leave empty to use the official endpoint.
+        /// The value must be an absolute URL, e.g. <c>https://tmdb-proxy.example.com</c>;
+        /// an optional sub-path is supported. Changes take effect after restarting the server.
+        /// </summary>
+        public string TmdbApiUrl { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the reverse-proxy URL used in place of the official TMDb image endpoint
+        /// (image.tmdb.org). Leave empty to use the official endpoint.
+        /// The value must be an absolute URL, e.g. <c>https://tmdb-proxy.example.com</c>;
+        /// the proxy must expose the same <c>/t/p/</c> layout as the official endpoint.
+        /// </summary>
+        public string TmdbImageUrl { get; set; } = string.Empty;
     }
 }
